@@ -1,0 +1,219 @@
+import numpy as np
+from numpy.linalg import LinAlgError
+import scipy
+import scipy.linalg
+import scipy.optimize
+from datetime import datetime
+from collections import defaultdict
+
+
+class LineSearchTool(object):
+    """
+    Line search tool for adaptively tuning the step size of the algorithm.
+    """
+    def __init__(self, method='Wolfe', **kwargs):
+        self._method = method
+        if self._method == 'Wolfe':
+            self.c1 = kwargs.get('c1', 1e-4)
+            self.c2 = kwargs.get('c2', 0.9)
+            self.alpha_0 = kwargs.get('alpha_0', 1.0)
+        elif self._method == 'Armijo':
+            self.c1 = kwargs.get('c1', 1e-4)
+            self.alpha_0 = kwargs.get('alpha_0', 1.0)
+        elif self._method == 'Constant':
+            self.c = kwargs.get('c', 1.0)
+        else:
+            raise ValueError('Unknown method {}'.format(method))
+
+    @classmethod
+    def from_dict(cls, options):
+        if type(options) != dict:
+            raise TypeError('LineSearchTool initializer must be of type dict')
+        return cls(**options)
+
+    def to_dict(self):
+        return self.__dict__
+
+    def line_search(self, oracle, x_k, d_k, previous_alpha=None):
+        """
+        Finds the step size alpha for a given starting point x_k
+        and for a given search direction d_k.
+        """
+        if self._method == 'Constant':
+            return self.c
+
+        phi = lambda alpha: oracle.func_directional(x_k, d_k, alpha)
+        dphi = lambda alpha: oracle.grad_directional(x_k, d_k, alpha)
+        phi0 = phi(0.0)
+        dphi0 = dphi(0.0)
+
+        if self._method == 'Armijo':
+            alpha = previous_alpha if previous_alpha is not None else self.alpha_0
+            while phi(alpha) > phi0 + self.c1 * alpha * dphi0:
+                alpha /= 2.0
+                if alpha < 1e-15:
+                    return None
+            return alpha
+
+        elif self._method == 'Wolfe':
+            # Try scipy's Wolfe line search
+            try:
+                from scipy.optimize.linesearch import scalar_search_wolfe2
+            except ImportError:
+                from scipy.optimize._linesearch import scalar_search_wolfe2
+
+            wolfe_result = scalar_search_wolfe2(
+                phi, dphi,
+                phi0=phi0,
+                derphi0=dphi0,
+                c1=self.c1,
+                c2=self.c2
+            )
+            alpha_star = wolfe_result[0]  # first element is always alpha_star
+
+            if alpha_star is not None:
+                return alpha_star
+
+            # Wolfe failed: fall back to Armijo backtracking from alpha_0
+            alpha = self.alpha_0
+            while phi(alpha) > phi0 + self.c1 * alpha * dphi0:
+                alpha /= 2.0
+                if alpha < 1e-15:
+                    return None
+            return alpha
+
+        return None
+
+
+def get_line_search_tool(line_search_options=None):
+    if line_search_options:
+        if type(line_search_options) is LineSearchTool:
+            return line_search_options
+        else:
+            return LineSearchTool.from_dict(line_search_options)
+    else:
+        return LineSearchTool()
+
+
+def gradient_descent(oracle, x_0, tolerance=1e-5, max_iter=10000,
+                     line_search_options=None, trace=False, display=False):
+    """
+    Gradient descent optimization method.
+    """
+    history = defaultdict(list) if trace else None
+    line_search_tool = get_line_search_tool(line_search_options)
+    x_k = np.copy(x_0)
+
+    # Compute initial gradient norm for stopping criterion
+    g_0 = oracle.grad(x_k)
+    grad_0_norm_sq = np.dot(g_0, g_0)
+
+    start_time = datetime.now()
+    alpha = None  # Track last step size for adaptive Armijo
+
+    for k in range(max_iter + 1):
+        f_k = oracle.func(x_k)
+        g_k = oracle.grad(x_k)
+        g_k_norm = np.linalg.norm(g_k)
+
+        # Check for numerical errors
+        if not np.isfinite(f_k) or not np.isfinite(g_k_norm):
+            return x_k, 'computational_error', history
+
+        # Record history
+        if trace:
+            history['time'].append((datetime.now() - start_time).total_seconds())
+            history['func'].append(f_k)
+            history['grad_norm'].append(g_k_norm)
+            if x_k.size <= 2:
+                history['x'].append(np.copy(x_k))
+
+        if display:
+            print('iter={:4d}  f={:.6e}  |g|={:.6e}'.format(k, float(f_k), float(g_k_norm)))
+
+        # Stopping criterion: ||g_k||^2 <= tolerance * ||g_0||^2
+        if g_k_norm ** 2 <= tolerance * grad_0_norm_sq:
+            return x_k, 'success', history
+
+        # Exhausted iterations
+        if k == max_iter:
+            return x_k, 'iterations_exceeded', history
+
+        # Search direction
+        d_k = -g_k
+
+        # Adaptive starting point for Armijo
+        if line_search_tool._method == 'Armijo' and alpha is not None:
+            prev_alpha = 2.0 * alpha
+        else:
+            prev_alpha = None
+
+        alpha = line_search_tool.line_search(oracle, x_k, d_k, previous_alpha=prev_alpha)
+
+        if alpha is None:
+            return x_k, 'computational_error', history
+
+        x_k = x_k + alpha * d_k
+
+    return x_k, 'iterations_exceeded', history
+
+
+def newton(oracle, x_0, tolerance=1e-5, max_iter=100,
+           line_search_options=None, trace=False, display=False):
+    """
+    Newton's optimization method.
+    """
+    history = defaultdict(list) if trace else None
+    line_search_tool = get_line_search_tool(line_search_options)
+    x_k = np.copy(x_0)
+
+    # Compute initial gradient norm for stopping criterion
+    g_0 = oracle.grad(x_k)
+    grad_0_norm_sq = np.dot(g_0, g_0)
+
+    start_time = datetime.now()
+
+    for k in range(max_iter + 1):
+        f_k = oracle.func(x_k)
+        g_k = oracle.grad(x_k)
+        g_k_norm = np.linalg.norm(g_k)
+
+        # Check for numerical errors
+        if not np.isfinite(f_k) or not np.isfinite(g_k_norm):
+            return x_k, 'computational_error', history
+
+        # Record history
+        if trace:
+            history['time'].append((datetime.now() - start_time).total_seconds())
+            history['func'].append(f_k)
+            history['grad_norm'].append(g_k_norm)
+            if x_k.size <= 2:
+                history['x'].append(np.copy(x_k))
+
+        if display:
+            print('iter={:4d}  f={:.6e}  |g|={:.6e}'.format(k, float(f_k), float(g_k_norm)))
+
+        # Stopping criterion
+        if g_k_norm ** 2 <= tolerance * grad_0_norm_sq:
+            return x_k, 'success', history
+
+        if k == max_iter:
+            return x_k, 'iterations_exceeded', history
+
+        # Compute Newton direction via Cholesky decomposition
+        H_k = oracle.hess(x_k)
+        try:
+            cho_factor = scipy.linalg.cho_factor(H_k)
+            d_k = scipy.linalg.cho_solve(cho_factor, -g_k)
+        except (LinAlgError, np.linalg.LinAlgError):
+            return x_k, 'newton_direction_error', history
+
+        # For Newton, always start line search from alpha=1
+        alpha = line_search_tool.line_search(oracle, x_k, d_k, previous_alpha=None)
+
+        if alpha is None:
+            return x_k, 'computational_error', history
+
+        x_k = x_k + alpha * d_k
+
+    return x_k, 'iterations_exceeded', history
